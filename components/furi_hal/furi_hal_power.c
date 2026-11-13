@@ -1,6 +1,7 @@
 #include "furi_hal_power.h"
 #include "furi_hal_bq27220.h"
 #include "furi_hal_bq25896.h"
+#include "furi_hal_display.h"
 #include "boards/board.h"
 
 #include <math.h>
@@ -405,16 +406,52 @@ void furi_hal_power_shutdown(void) {
     }
     vTaskDelay(pdMS_TO_TICKS(200)); /* debounce */
 
+    /* Backlight + panel off.
+     *
+     * Deliberately NO gpio_hold_en() / gpio_deep_sleep_hold_en() here. Holding
+     * digital IOs across deep sleep makes esp_deep_sleep_start() run
+     * esp_sleep_isolate_digital_gpio(), which assert-fails with "the stack of the
+     * task calling esp_deep_sleep_start must be in internal ram" — and the
+     * power-service FuriThread stack lives in PSRAM (SPIRAM_ALLOW_STACK_EXTERNAL
+     * + SPIRAM_MALLOC_ALWAYSINTERNAL=1024 pushes the 4 KB stack external). That
+     * assert panicked (reset_reason=4) and rebooted on every power-off. Without
+     * the hold, the isolation step is skipped and deep sleep starts cleanly. */
+#ifdef BOARD_PIN_LCD_BL
+    furi_hal_display_set_backlight(0);
+#endif
+    furi_hal_display_sleep();
+
     /* Power down peripherals (CC1101 + WS2812) */
 #ifdef BOARD_PIN_PWR_EN
     gpio_set_level((gpio_num_t)BOARD_PIN_PWR_EN, 0);
 #endif
 
-    /* Configure BOOT/encoder button (GPIO0) as wake-up source (active low) */
+    /* Wake on the BOOT/encoder button (GPIO0, active low). Its external
+     * boot-strapping pull-up keeps it HIGH across deep sleep, so it does not
+     * re-wake immediately — unlike the side key (GPIO6), which floats LOW and
+     * rebooted the device instantly (regression from the multi-boot PR). */
 #if SOC_PM_SUPPORT_EXT0_WAKEUP
     esp_sleep_enable_ext0_wakeup((gpio_num_t)BOARD_PIN_BUTTON_BOOT, 0);
 #else
     esp_deep_sleep_enable_gpio_wakeup(BIT(BOARD_PIN_BUTTON_BOOT), ESP_GPIO_WAKEUP_GPIO_LOW);
+#endif
+    /* Clear the deep-sleep GPIO auto-hold bit. It lives in the RTC domain
+     * (RTC_CNTL_DIG_ISO_REG) and SURVIVES resets/panics, so a firmware that once
+     * called gpio_deep_sleep_hold_en() leaves it set for every later boot. While
+     * it is set, esp_deep_sleep_start() runs esp_sleep_isolate_digital_gpio(),
+     * which assert-fails because our power-service stack is in PSRAM -> panic ->
+     * reboot. Only a full power-cycle would clear it otherwise, which is exactly
+     * why the reboot persisted across re-flashes. Disabling it unconditionally
+     * makes power-off deterministic regardless of what ran before.
+     *
+     * Guarded by the exact same SOC caps that gate the function's definition in
+     * esp-idf (esp_driver_gpio/src/gpio.c): it only exists for chips with global
+     * (non-single-IO) deep-sleep hold, i.e. the ESP32-S3. On the ESP32-C6
+     * (SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP=1) the symbol is absent and the
+     * whole auto-hold problem never applied, so skipping it keeps the C6 build
+     * linking. */
+#if SOC_GPIO_SUPPORT_HOLD_IO_IN_DSLP && !SOC_GPIO_SUPPORT_HOLD_SINGLE_IO_IN_DSLP
+    gpio_deep_sleep_hold_dis();
 #endif
     esp_deep_sleep_start();
 }

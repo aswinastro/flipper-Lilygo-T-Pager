@@ -23,7 +23,7 @@ idf_component_register(
         "core/pubsub.c"
         "core/furi_string.c"
     INCLUDE_DIRS "." "core"
-    REQUIRES mlib toolbox
+    REQUIRES mlib toolbox esp_common freertos
     PRIV_REQUIRES furi_hal
 )
 

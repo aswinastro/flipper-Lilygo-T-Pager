@@ -1,5 +1,7 @@
 #include <furi.h>
+#include <furi_hal.h>
 #include <gui.h>
+#include <toolbox/fw_version.h>
 #include <view_dispatcher.h>
 #include <widget.h>
 
@@ -33,6 +35,7 @@ int32_t about_app(void* p) {
         FontPrimary,
         "Flipper Zero\nESP32 Port");
 
+#if defined(BOARD_LILYGO_T_LORA_PAGER) || defined(BOARD_LCD_PANEL_ST7796) || defined(BOARD_NAME)
     widget_add_string_multiline_element(
         app->widget,
         64,
@@ -40,8 +43,19 @@ int32_t about_app(void* p) {
         AlignCenter,
         AlignTop,
         FontSecondary,
-        "Lily T-Embed\n"
-        "FW: 1.1.4 - Sor3nt Stuff");
+        "T - Pager\n"
+        "FW: " FURI_ESP32_VERSION_FULL);
+#else
+    widget_add_string_multiline_element(
+        app->widget,
+        64,
+        36,
+        AlignCenter,
+        AlignTop,
+        FontSecondary,
+        "T-Embed CC1101\n"
+        "FW: " FURI_ESP32_VERSION_FULL);
+#endif
 
     View* widget_view = widget_get_view(app->widget);
     view_set_previous_callback(widget_view, about_app_exit);

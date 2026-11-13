@@ -41,6 +41,7 @@ set(FURI_HAL_SRCS
     "furi_hal_rfid.c"
     "furi_hal_bq27220.c"
     "furi_hal_bq25896.c"
+    "xl9555.c"
     "fatfs_compat.c"
 )
 
@@ -48,6 +49,7 @@ set(FURI_HAL_REQUIRES
     furi toolbox input driver esp_lcd fatfs sdmmc datetime
     ble_hid ble_serial ble_profile furi_ble flipper_protobuf
     esp_adc esp_driver_rmt esp_driver_i2s nvs_flash
+    app_update esp_partition espressif__esp_lcd_st7796
 )
 
 # HID backend: TinyUSB on SoCs with USB-OTG, stub elsewhere.

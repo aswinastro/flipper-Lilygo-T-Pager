@@ -69,9 +69,8 @@ void canvas_reset(Canvas* canvas) {
 
 void canvas_commit(Canvas* canvas) {
     furi_check(canvas);
-    u8g2_SendBuffer(&canvas->fb);
 
-    // Send framebuffer to physical display
+    // Send framebuffer to physical display (u8g2_SendBuffer is a no-op stub on ESP32)
     uint8_t* buf = canvas_get_buffer(canvas);
     size_t buf_size = canvas_get_buffer_size(canvas);
 

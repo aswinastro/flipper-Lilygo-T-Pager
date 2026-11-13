@@ -138,9 +138,14 @@ void app_main(void) {
             FLIPPER_SERVICES[i].app,
             NULL);
         furi_thread_set_appid(thread, FLIPPER_SERVICES[i].appid);
+        if(strcmp(FLIPPER_SERVICES[i].appid, "input") == 0) {
+            furi_thread_set_priority(thread, FuriThreadPriorityHighest);
+        } else if(strcmp(FLIPPER_SERVICES[i].appid, "gui") == 0) {
+            furi_thread_set_priority(thread, FuriThreadPriorityHigh);
+        }
         furi_thread_start(thread);
 
-        furi_delay_ms(10);
+        furi_delay_ms(2);
     }
 
     for(size_t i = 0; i < FLIPPER_ON_SYSTEM_START_COUNT; i++) {

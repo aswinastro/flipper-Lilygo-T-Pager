@@ -31,27 +31,52 @@ import sys
 import time
 from pathlib import Path
 
-DEFAULT_ESP_IDF_DIR = r"C:\Espressif\frameworks\esp-idf-v5.4.1"
-DEFAULT_PORT = "COM14"
+def _find_default_esp_idf() -> str:
+    if sys.platform == "win32":
+        frameworks = Path(r"C:\Espressif\frameworks")
+        if frameworks.exists():
+            candidates = sorted(frameworks.glob("esp-idf*"), reverse=True)
+            if candidates:
+                return str(candidates[0])
+        return r"C:\Espressif\frameworks\esp-idf-v5.4.1"
+    else:
+        return str(Path.home() / "esp" / "esp-idf")
+
+DEFAULT_ESP_IDF_DIR = _find_default_esp_idf()
+DEFAULT_PORT = "COM14" if sys.platform == "win32" else "/dev/ttyUSB0"
 DEFAULT_DURATION = 8.0
 
 # Mirrors build.sh board mapping.
 BOARDS = {
-    "t_embed":      ("lilygo_t_embed_cc1101", "esp32s3", "build_t_embed"),
-    "esp32s3":      ("esp32s3_generic",       "esp32s3", "build_s3"),
-    "waveshare_c6": ("waveshare_c6_1.9",      "esp32c6", "build_waveshare_c6"),
+    "t_embed":           ("lilygo_t_embed_cc1101", "esp32s3", "build_t_embed"),
+    "t_lora_pager":      ("lilygo_t_lora_pager",   "esp32s3", "build_t_lora_pager"),
+    "esp32s3":           ("esp32s3_generic",       "esp32s3", "build_s3"),
+    "waveshare_c6":      ("waveshare_c6_1.9",      "esp32c6", "build_waveshare_c6"),
+    "waveshare_c6_1.9":  ("waveshare_c6_1.9",      "esp32c6", "build_waveshare_c6"),
+    "waveshare_c6_1.47": ("waveshare_c6_1.47",     "esp32c6", "build_waveshare_c6_1.47"),
 }
 
 REPO_ROOT = Path(__file__).resolve().parent
 
 
+def _board_cmake_args(flipper_board: str, build_dir: str) -> str:
+    args = f"-B {build_dir} -DFLIPPER_BOARD={flipper_board}"
+    board_defaults = REPO_ROOT / f"sdkconfig.defaults.{flipper_board}"
+    if board_defaults.exists():
+        args += f' -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.{flipper_board}"'
+    return args
+
+
 def get_esp_idf_dir() -> Path:
-    p = Path(os.environ.get("ESP_IDF_DIR", DEFAULT_ESP_IDF_DIR))
-    if not p.exists():
-        sys.exit(
-            f"ESP_IDF_DIR '{p}' does not exist. "
-            "Set ESP_IDF_DIR or install ESP-IDF v5.4.x there.")
-    return p
+    env_val = os.environ.get("ESP_IDF_DIR")
+    if env_val and Path(env_val).exists():
+        return Path(env_val)
+    default_p = Path(DEFAULT_ESP_IDF_DIR)
+    if default_p.exists():
+        return default_p
+    sys.exit(
+        f"ESP-IDF directory not found (checked '{env_val}' and '{default_p}'). "
+        "Set ESP_IDF_DIR or install ESP-IDF there.")
 
 
 def get_port(arg_port):
@@ -67,10 +92,12 @@ def env_for_idf(extra=None):
 
 
 def run_with_idf_env(esp_idf_dir: Path, args: str, extra_env=None) -> int:
-    # shell=True is required on Windows so cmd.exe parses the && and the quoted path
-    # in `call "..."`; passing as a list mangles the quoting.
-    cmd = f'call "{esp_idf_dir}\\export.bat" && idf.py {args}'
-    return subprocess.run(cmd, shell=True, env=env_for_idf(extra_env), cwd=str(REPO_ROOT)).returncode
+    if sys.platform == "win32":
+        cmd = f'call "{esp_idf_dir}\\export.bat" && idf.py {args}'
+        return subprocess.run(cmd, shell=True, env=env_for_idf(extra_env), cwd=str(REPO_ROOT)).returncode
+    else:
+        cmd = f'. "{esp_idf_dir}/export.sh" && idf.py {args}'
+        return subprocess.run(cmd, shell=True, executable="/bin/bash", env=env_for_idf(extra_env), cwd=str(REPO_ROOT)).returncode
 
 
 def cmd_setup(args):
@@ -91,23 +118,25 @@ def cmd_check(args):
 
 def cmd_build(args):
     flipper_board, target, build_dir = BOARDS[args.board]
-    common = f"-B {build_dir} -DFLIPPER_BOARD={flipper_board}"
+    _purge_stale_sdkconfig(target, build_dir)
+    common = _board_cmake_args(flipper_board, build_dir)
     esp_idf_dir = get_esp_idf_dir()
-    # FLIPPER_BOARD must also be in the env: fam_config.py reads it via
-    # os.environ to filter board-incompatible apps (e.g. NFC/IR on Waveshare C6).
     extra = {"FLIPPER_BOARD": flipper_board}
-    rc = run_with_idf_env(esp_idf_dir, f"{common} set-target {target}", extra)
-    if rc != 0:
-        return rc
+    ninja_file = REPO_ROOT / build_dir / "build.ninja"
+    if not ninja_file.exists():
+        rc = run_with_idf_env(esp_idf_dir, f"{common} set-target {target}", extra)
+        if rc != 0:
+            return rc
     return run_with_idf_env(esp_idf_dir, f"{common} reconfigure build", extra)
 
 
 def cmd_flash(args):
     flipper_board, _, build_dir = BOARDS[args.board]
     port = get_port(args.port)
+    common = _board_cmake_args(flipper_board, build_dir)
     return run_with_idf_env(
         get_esp_idf_dir(),
-        f"-B {build_dir} -DFLIPPER_BOARD={flipper_board} -p {port} flash",
+        f"{common} -p {port} flash",
         {"FLIPPER_BOARD": flipper_board})
 
 
@@ -206,7 +235,8 @@ def cmd_cross_build(args):
     the shared root sdkconfig and breaks both builds.
     """
     esp_idf_dir = get_esp_idf_dir()
-    boards_to_build = args.boards if args.boards else list(BOARDS.keys())
+    default_boards = ["t_embed", "esp32s3", "waveshare_c6_1.9", "waveshare_c6_1.47"]
+    boards_to_build = args.boards if args.boards else default_boards
 
     print(f"[cross-build] Building {len(boards_to_build)} board(s): "
           f"{', '.join(boards_to_build)}")
@@ -224,7 +254,7 @@ def cmd_cross_build(args):
 
         _purge_stale_sdkconfig(target, build_dir)
 
-        common = f"-B {build_dir} -DFLIPPER_BOARD={flipper_board}"
+        common = _board_cmake_args(flipper_board, build_dir)
         extra = {"FLIPPER_BOARD": flipper_board}
 
         rc = run_with_idf_env(esp_idf_dir, f"{common} set-target {target}", extra)

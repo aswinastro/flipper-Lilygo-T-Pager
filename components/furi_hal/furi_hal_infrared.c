@@ -36,6 +36,20 @@
 #define IR_RMT_TX_RESOLUTION_HZ     1000000 /* 1 MHz = 1 us per tick */
 #define IR_RMT_RX_MAX_SYMBOLS       1024
 
+/* When the RX line returns to idle, RMT ends the burst and records the
+ * terminating space as a zero-duration "end marker" — so the long inter-frame
+ * space that trails every burst is never delivered to the decoder. The STM32
+ * capture path delivers that space naturally (when the next burst's leading
+ * edge arrives), and min_split_time protocols (NEC, Samsung, RC5/6, SIRC,
+ * Kaseikyo, RCA, Pioneer) rely on it to finish decoding mid-stream. Without it
+ * they can only complete via the silence timeout — which never fires while a
+ * button is HELD, because the ~110 ms repeat bursts keep restarting it, so a
+ * held remote is never learned. We therefore synthesise the trailing space at
+ * the end of each idle-terminated burst. Its duration must exceed the largest
+ * protocol min_split_time (Pioneer = 26000 us) yet stay below NEC's repeat
+ * pause max (150000 us) and the silence timeout, so 50 ms is a safe choice. */
+#define IR_RX_FRAME_END_SPACE_US 50000
+
 /* ---- State ---- */
 
 typedef enum {
@@ -104,6 +118,9 @@ static bool IRAM_ATTR ir_rmt_rx_done_callback(rmt_channel_handle_t channel,
     (void)channel;
     (void)user_ctx;
 
+    bool last_level_mark = false; /* level of the last edge we delivered */
+    bool any_edge = false;
+
     /* Process received symbols and call capture callback for each edge */
     for(size_t i = 0; i < edata->num_symbols; i++) {
         const rmt_symbol_word_t* sym = &edata->received_symbols[i];
@@ -117,12 +134,28 @@ static bool IRAM_ATTR ir_rmt_rx_done_callback(rmt_channel_handle_t channel,
             ir_rx.capture_callback(
                 ir_rx.capture_context, sym->level0, sym->duration0);
             ir_rx_restart_timeout();
+            last_level_mark = sym->level0;
+            any_edge = true;
         }
         if(sym->duration1 > 0 && ir_rx.capture_callback) {
             ir_rx.capture_callback(
                 ir_rx.capture_context, sym->level1, sym->duration1);
             ir_rx_restart_timeout();
+            last_level_mark = sym->level1;
+            any_edge = true;
         }
+    }
+
+    /* A burst always ends on a Mark (the trailing Space is the idle that
+     * terminated reception, dropped above as a zero-duration end marker).
+     * Deliver that trailing Space synthetically so min_split_time protocols
+     * decode immediately, instead of waiting for a silence timeout that never
+     * arrives while a held remote keeps repeating. See IR_RX_FRAME_END_SPACE_US.
+     * Decoded protocols consume it (the worker resets its timing count, so no
+     * stray raw timing); raw signals just gain a trailing gap. */
+    if(any_edge && last_level_mark && ir_rx.capture_callback) {
+        ir_rx.capture_callback(ir_rx.capture_context, false, IR_RX_FRAME_END_SPACE_US);
+        ir_rx_restart_timeout();
     }
 
     /* Re-start receiving for next burst */
@@ -273,6 +306,49 @@ void furi_hal_infrared_async_rx_set_timeout_isr_callback(
  * larger than mem_block_symbols. */
 #define IR_TX_MAX_SYMBOLS 600
 
+#define IR_RMT_MAX_DURATION 32767
+
+typedef struct {
+    rmt_symbol_word_t* symbols;
+    size_t capacity; /* in symbols */
+    size_t count; /* completed symbols */
+    bool half; /* symbols[count] already holds duration0 */
+} IrTxEmitter;
+
+static bool ir_tx_emit_phase(IrTxEmitter* e, uint32_t duration, bool level) {
+    if(duration == 0) duration = 1; /* RMT reads a zero duration as end-of-frame */
+
+    const size_t chunks = (duration + IR_RMT_MAX_DURATION - 1) / IR_RMT_MAX_DURATION;
+    const size_t free_halves = (e->capacity - e->count) * 2 - (e->half ? 1 : 0);
+    if(chunks > free_halves) return false;
+
+    while(duration > 0) {
+        const uint32_t chunk = duration > IR_RMT_MAX_DURATION ? IR_RMT_MAX_DURATION : duration;
+        duration -= chunk;
+
+        if(!e->half) {
+            e->symbols[e->count].duration0 = chunk;
+            e->symbols[e->count].level0 = level ? 1 : 0;
+            e->half = true;
+        } else {
+            e->symbols[e->count].duration1 = chunk;
+            e->symbols[e->count].level1 = level ? 1 : 0;
+            e->count++;
+            e->half = false;
+        }
+    }
+
+    return true;
+}
+
+static void ir_tx_emit_flush(IrTxEmitter* e) {
+    if(!e->half) return;
+    e->symbols[e->count].duration1 = 1;
+    e->symbols[e->count].level1 = 0;
+    e->count++;
+    e->half = false;
+}
+
 static void ir_tx_task(void* arg) {
     (void)arg;
 
@@ -288,57 +364,42 @@ static void ir_tx_task(void* arg) {
 
     bool running = true;
     while(running) {
-        size_t sym_count = 0;
+        IrTxEmitter emitter = {
+            .symbols = symbols,
+            .capacity = IR_TX_MAX_SYMBOLS,
+            .count = 0,
+            .half = false,
+        };
         bool packet_end = false;
         bool last_packet = false;
 
-        /* Accumulate one full packet of symbols from the callback */
-        while(sym_count < IR_TX_MAX_SYMBOLS && !packet_end) {
-            uint32_t duration_mark = 0;
-            uint32_t duration_space = 0;
-            bool level_mark = false;
-            bool level_space = false;
+        while(!packet_end) {
+            uint32_t duration = 0;
+            bool level = false;
 
-            /* Get mark timing */
-            FuriHalInfraredTxGetDataState state_mark =
-                ir_tx.data_callback(ir_tx.data_context, &duration_mark, &level_mark);
+            const FuriHalInfraredTxGetDataState state =
+                ir_tx.data_callback(ir_tx.data_context, &duration, &level);
 
-            if(state_mark == FuriHalInfraredTxGetDataStateLastDone && duration_mark == 0) {
+            if(state == FuriHalInfraredTxGetDataStateLastDone && duration == 0) {
                 last_packet = true;
                 break;
             }
 
-            /* Get space timing */
-            FuriHalInfraredTxGetDataState state_space = FuriHalInfraredTxGetDataStateOk;
-            if(state_mark == FuriHalInfraredTxGetDataStateOk) {
-                state_space =
-                    ir_tx.data_callback(ir_tx.data_context, &duration_space, &level_space);
-            } else {
-                /* Mark was the last in this packet, add a trailing space */
-                duration_space = 0;
-                level_space = false;
-                if(state_mark == FuriHalInfraredTxGetDataStateDone) {
-                    packet_end = true;
-                } else {
-                    last_packet = true;
-                    packet_end = true;
-                }
+            if(!ir_tx_emit_phase(&emitter, duration, level)) {
+                /* Buffer exhausted — send what we have (see IR_TX_MAX_SYMBOLS). */
+                break;
             }
 
-            /* Build RMT symbol: duration0=mark, duration1=space */
-            symbols[sym_count].duration0 = duration_mark;
-            symbols[sym_count].level0 = level_mark ? 1 : 0;
-            symbols[sym_count].duration1 = duration_space > 0 ? duration_space : 1;
-            symbols[sym_count].level1 = level_space ? 1 : 0;
-            sym_count++;
-
-            if(state_space == FuriHalInfraredTxGetDataStateDone) {
+            if(state == FuriHalInfraredTxGetDataStateDone) {
                 packet_end = true;
-            } else if(state_space == FuriHalInfraredTxGetDataStateLastDone) {
+            } else if(state == FuriHalInfraredTxGetDataStateLastDone) {
                 packet_end = true;
                 last_packet = true;
             }
         }
+
+        ir_tx_emit_flush(&emitter);
+        const size_t sym_count = emitter.count;
 
         if(sym_count > 0) {
             /* Transmit the whole packet in a single (gapless) transaction */

@@ -77,6 +77,9 @@ def parse_manifest(manifest_path: Path) -> list[FlipperApplication]:
         "ExtFile": ExtFile,
         "Lib": Lib,
         "FlipperAppType": FlipperAppType,
+        # Path to this manifest — upstream fbt exposes it so manifests can locate
+        # sibling files (e.g. protopirate reads its defines.h relative to it).
+        "app_manifest_path": str(manifest_path),
     }
     try:
         with manifest_path.open("rt", encoding="utf-8") as manifest_file:
@@ -368,8 +371,10 @@ def generate_ported_cmake(buildset: AppBuildset, project_dir: Path) -> str:
     ported_apps = [
         app
         for app in sorted_unique_apps(buildset.apps)
-        if "/applications/" in getattr(app, "_manifest_path", "").replace("\\", "/")
-        or "/applications_user/" in getattr(app, "_manifest_path", "").replace("\\", "/")
+        if (
+            "/applications/" in getattr(app, "_manifest_path", "").replace("\\", "/")
+            or "/applications_user/" in getattr(app, "_manifest_path", "").replace("\\", "/")
+        )
         and (app.apptype != FlipperAppType.STARTUP or bool(app.sources))
     ]
 

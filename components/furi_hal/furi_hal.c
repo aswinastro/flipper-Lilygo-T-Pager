@@ -4,10 +4,56 @@
 #include <esp_log.h>
 #include <nvs_flash.h>
 
+#if defined(BOARD_HAS_XL9555) && BOARD_HAS_XL9555
+#include "xl9555.h"
+#endif
+
 static const char* TAG = "FuriHal";
 
 void furi_hal_init_early(void) {
     furi_hal_cortex_init_early();
+
+#if defined(BOARD_HAS_XL9555) && BOARD_HAS_XL9555
+    /* Initialize XL9555 GPIO expander on shared I2C bus */
+    esp_err_t xl_err = xl9555_init(
+        BOARD_I2C_PORT, BOARD_XL9555_I2C_ADDR,
+        BOARD_I2C_SDA, BOARD_I2C_SCL, BOARD_I2C_FREQ_HZ);
+    if(xl_err == ESP_OK) {
+        /* Configure SD Card power pin as output and enable SD power */
+        xl9555_config_pin(XL9555_PIN_SD_PWR_EN, false);
+        xl9555_write_pin(XL9555_PIN_SD_PWR_EN, true);
+        ESP_LOGI(TAG, "XL9555 initialized: SD card power enabled (GPIO%d=HIGH)", XL9555_PIN_SD_PWR_EN);
+
+        /* Configure SD card detect as input */
+        xl9555_config_pin(XL9555_PIN_SD_DETECT, true);
+    } else {
+        ESP_LOGE(TAG, "XL9555 init failed: %s", esp_err_to_name(xl_err));
+    }
+#endif
+
+#if defined(BOARD_SPI_SCK)
+    /* Shared SPI bus on T-LoRa Pager: ensure all peripheral CS pins are initialized HIGH (inactive) */
+    static const GpioPin cs_display = {.port = NULL, .pin = BOARD_PIN_LCD_CS};
+    static const GpioPin cs_sd = {.port = NULL, .pin = BOARD_PIN_SD_CS};
+    furi_hal_gpio_init_simple(&cs_display, GpioModeOutputPushPull);
+    furi_hal_gpio_write(&cs_display, true);
+    furi_hal_gpio_init_simple(&cs_sd, GpioModeOutputPushPull);
+    furi_hal_gpio_write(&cs_sd, true);
+
+#ifdef BOARD_PIN_LORA_CS
+    static const GpioPin cs_lora = {.port = NULL, .pin = BOARD_PIN_LORA_CS};
+    furi_hal_gpio_init_simple(&cs_lora, GpioModeOutputPushPull);
+    furi_hal_gpio_write(&cs_lora, true);
+#endif
+
+#ifdef BOARD_PIN_NFC_CS
+    static const GpioPin cs_nfc = {.port = NULL, .pin = BOARD_PIN_NFC_CS};
+    furi_hal_gpio_init_simple(&cs_nfc, GpioModeOutputPushPull);
+    furi_hal_gpio_write(&cs_nfc, true);
+#endif
+    ESP_LOGI(TAG, "Shared SPI CS lines initialized HIGH (Display=%d, SD=%d, LoRa=%d, NFC=%d)",
+             BOARD_PIN_LCD_CS, BOARD_PIN_SD_CS, BOARD_PIN_LORA_CS, BOARD_PIN_NFC_CS);
+#endif
 
 #ifdef BOARD_PIN_PWR_EN
     /* Power-enable must be set early — powers CC1101, BQ27220 fuel gauge, WS2812 */

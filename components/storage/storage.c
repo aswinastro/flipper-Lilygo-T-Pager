@@ -65,11 +65,23 @@ static bool storage_build_app_alias_path(
 
 static void storage_ensure_app_alias_dir(Storage* storage, const char* real_root) {
     UNUSED(storage);
+    static char last_ensured_data_appid[64] = {0};
+    static char last_ensured_assets_appid[64] = {0};
+
+    const char* appid = storage_current_appid();
+    if(strcmp(real_root, "apps_data") == 0) {
+        if(strcmp(last_ensured_data_appid, appid) == 0) return;
+        strncpy(last_ensured_data_appid, appid, sizeof(last_ensured_data_appid) - 1);
+    } else if(strcmp(real_root, "apps_assets") == 0) {
+        if(strcmp(last_ensured_assets_appid, appid) == 0) return;
+        strncpy(last_ensured_assets_appid, appid, sizeof(last_ensured_assets_appid) - 1);
+    }
+
     char base_path[256];
     char app_path[256];
 
     snprintf(base_path, sizeof(base_path), "%s/%s", SD_MOUNT_POINT, real_root);
-    snprintf(app_path, sizeof(app_path), "%s/%s/%s", SD_MOUNT_POINT, real_root, storage_current_appid());
+    snprintf(app_path, sizeof(app_path), "%s/%s/%s", SD_MOUNT_POINT, real_root, appid);
 
     storage_sd_bus_lock();
     mkdir(base_path, 0755);
@@ -764,6 +776,19 @@ FS_Error storage_common_rename(Storage* storage, const char* old_path, const cha
         return storage_errno_to_fserror(errno);
     }
     return FSE_OK;
+}
+
+FS_Error storage_common_migrate(Storage* storage, const char* source, const char* dest) {
+    furi_check(storage);
+    // ESP32 port: upstream implements this via storage_common_merge (a recursive
+    // directory merge), which this port doesn't have. Migration is a legacy path
+    // (apps relocating their old data dir) that realistically never triggers on
+    // ESP32 since there's no pre-existing data, so a plain rename covers the
+    // common case. If there's nothing to migrate, succeed silently.
+    if(!storage_common_exists(storage, source)) {
+        return FSE_OK;
+    }
+    return storage_common_rename(storage, source, dest);
 }
 
 FS_Error storage_common_copy(Storage* storage, const char* old_path, const char* new_path) {

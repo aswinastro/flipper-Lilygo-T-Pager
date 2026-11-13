@@ -3,6 +3,7 @@
 #include "furi_hal_usb_hid_backend.h"
 
 #include <furi.h>
+#include <furi_hal_version.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -164,14 +165,28 @@ void tud_hid_set_report_cb(
 
 /* Backend start/stop - called from furi_hal_usb.c */
 bool furi_hal_usb_hid_backend_start(const FuriHalUsbHidConfig* cfg) {
-    if(s_state.installed) return true;
+    if(s_state.installed) {
+        /* Already installed. This happens when re-entering BadUsb after a config-
+         * menu visit: leaving the work scene calls set_config(NULL) -> backend_stop,
+         * which sets mounted=false, and returning calls set_config(usb_hid) ->
+         * backend_start. The TinyUSB stack and the physical USB connection stay up
+         * the whole time (we never tear the stack down on this port), so resync our
+         * mounted flag with the real device state instead of leaving it stuck at
+         * false — otherwise BadUsb shows "Connect to device" until a USB replug. */
+        hid_state_lock();
+        hid_publish_mount(tud_mounted());
+        hid_state_unlock();
+        return true;
+    }
 
     if(!s_state_mutex) {
         s_state_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     }
 
     const char* manuf = (cfg && cfg->manuf[0]) ? cfg->manuf : "Flipper Devices Inc.";
-    const char* product = (cfg && cfg->product[0]) ? cfg->product : "Flipper Zero";
+    const char* product =
+        (cfg && cfg->product[0]) ? cfg->product : furi_hal_version_get_name_ptr();
+    if(!product || !product[0]) product = "Flipper Zero";
     uint16_t vid = (cfg && cfg->vid) ? (uint16_t)cfg->vid : HID_VID_DEFAULT;
     uint16_t pid = (cfg && cfg->pid) ? (uint16_t)cfg->pid : HID_PID_DEFAULT;
 
@@ -238,8 +253,31 @@ void furi_hal_hid_set_state_callback(HidStateCallback cb, void* ctx) {
     if(cb) cb(s_state.mounted, ctx);
 }
 
+/* Wait until the HID IN endpoint can accept a new report.
+ *
+ * tud_hid_*_report() only queues into the endpoint FIFO; the report is "in
+ * flight" (tud_hid_ready() == false) until the host polls it (every HID_POLL_MS).
+ * BadUsb fires kb_press() immediately followed by kb_release() with no delay, so
+ * without this wait the release report is dropped while the press is still in
+ * flight -> the host never sees key-up -> auto-repeat / garbled output. This is
+ * especially visible on the composite device (HID shares the bus with CDC+MSC).
+ *
+ * Must be called with the state lock held; the lock is released transiently
+ * while delaying so TinyUSB mount/umount callbacks can still run. Returns true
+ * if the endpoint is ready to accept a report. */
+static bool hid_wait_tx_ready_locked(void) {
+    uint32_t timeout_ms = 100;
+    while(s_state.mounted && !tud_hid_ready()) {
+        if(timeout_ms-- == 0) break;
+        hid_state_unlock();
+        furi_delay_ms(1);
+        hid_state_lock();
+    }
+    return s_state.mounted && tud_hid_ready();
+}
+
 static bool send_keyboard_report_locked(void) {
-    if(!s_state.mounted || !tud_hid_ready()) return false;
+    if(!hid_wait_tx_ready_locked()) return false;
     return tud_hid_keyboard_report(REPORT_ID_KEYBOARD, s_state.modifiers, s_state.keys);
 }
 
@@ -302,7 +340,7 @@ bool furi_hal_hid_kb_release_all(void) {
 }
 
 static bool send_mouse_report_locked(int8_t dx, int8_t dy, int8_t scroll) {
-    if(!s_state.mounted || !tud_hid_ready()) return false;
+    if(!hid_wait_tx_ready_locked()) return false;
     return tud_hid_mouse_report(
         REPORT_ID_MOUSE, s_state.mouse_buttons, dx, dy, scroll, 0);
 }
@@ -338,7 +376,7 @@ bool furi_hal_hid_mouse_scroll(int8_t delta) {
 }
 
 static bool send_consumer_report_locked(void) {
-    if(!s_state.mounted || !tud_hid_ready()) return false;
+    if(!hid_wait_tx_ready_locked()) return false;
     /* Standard TUD_HID_REPORT_DESC_CONSUMER emits one 16-bit usage.
      * We pick the most-recently pressed key that is still active. */
     uint16_t usage = 0;
